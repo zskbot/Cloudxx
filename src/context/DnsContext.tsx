@@ -17,7 +17,6 @@ import {
   initialRecords,
   initialRegistrars,
   initialNotificationSettings,
-  initialAuditLogs,
   initialTeamMembers,
   initialBackups,
   initialGlobalNodes,
@@ -118,34 +117,22 @@ const STORAGE_KEY_PREFIX = 'dns_sentinel_enterprise_';
 
 export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   // Initialize state with localStorage fallbacks
-  const [domains, setDomains] = useState<DomainZone[]>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}domains`);
-    return saved ? JSON.parse(saved) : initialDomains;
-  });
+  const [domains, setDomains] = useState<DomainZone[]>([]);
 
-  const [records, setRecords] = useState<DNSRecord[]>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}records`);
-    return saved ? JSON.parse(saved) : initialRecords;
-  });
+  const [records, setRecords] = useState<DNSRecord[]>([]);
 
   const [selectedDomainId, setSelectedDomainId] = useState<string>(() => {
     return initialDomains[0]?.id || '';
   });
 
-  const [registrars, setRegistrars] = useState<RegistrarIntegration[]>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}registrars`);
-    return saved ? JSON.parse(saved) : initialRegistrars;
-  });
+  const [registrars, setRegistrars] = useState<RegistrarIntegration[]>([]);
 
   const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}notifications`);
     return saved ? JSON.parse(saved) : initialNotificationSettings;
   });
 
-  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>(() => {
-    const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}audit`);
-    return saved ? JSON.parse(saved) : initialAuditLogs;
-  });
+  const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>(() => {
     const saved = localStorage.getItem(`${STORAGE_KEY_PREFIX}team`);
@@ -210,26 +197,56 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }, 4500);
   };
 
-  // Sync to localStorage
+  // Domain, DNS record and registrar state is hydrated from the authenticated API.
+  // Secrets are never persisted in browser storage.
   useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}domains`, JSON.stringify(domains));
-  }, [domains]);
-
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}records`, JSON.stringify(records));
-  }, [records]);
-
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}registrars`, JSON.stringify(registrars));
-  }, [registrars]);
+    let active = true;
+    const hydrate = async () => {
+      try {
+        setSyncStatus('syncing');
+        const [domainResponse, registrarResponse, auditResponse] = await Promise.all([
+          fetch('/api/domains', { cache: 'no-store' }),
+          fetch('/api/registrars', { cache: 'no-store' }),
+          fetch('/api/audit-logs', { cache: 'no-store' }),
+        ]);
+        if (!domainResponse.ok || !registrarResponse.ok) throw new Error('API unavailable');
+        const domainPayload = await domainResponse.json();
+        const registrarPayload = await registrarResponse.json();
+        const auditPayload = auditResponse.ok ? await auditResponse.json() : { logs: [] };
+        if (!active) return;
+        const mappedDomains: DomainZone[] = (domainPayload.domains || []).map((d: any) => ({
+          id: d.id, name: d.name, registrar: d.registrar || 'Cloudflare', status: d.status || 'active',
+          autoRenew: !!d.autoRenew, expiresAt: d.expiresAt || '', nameservers: d.nameservers || [], dnssec: !!d.dnssec,
+          sslStatus: 'provisioning', sslExpiryDate: '', sslIssuer: '', autoSslRenewal: false,
+          recordCount: d.records?.length || 0, qps: 0, environment: d.environment || 'production',
+          createdAt: d.createdAt, delegationSynced: true,
+        }));
+        const mappedRecords: DNSRecord[] = (domainPayload.domains || []).flatMap((d: any) => (d.records || []).map((r: any, index: number) => ({
+          id: r.id, domainId: d.id, domainName: d.name, type: r.type, name: r.name, content: r.content,
+          ttl: r.ttlAuto ? 'Auto' : r.ttl, priority: r.priority ?? undefined, port: r.port ?? undefined,
+          weight: r.weight ?? undefined, proxied: !!r.proxied, category: 'web', autoUpdateEnabled: false,
+          status: 'active', lastUpdated: r.updatedAt, updatedBy: 'Cloudxx', comment: r.comment || '', sortOrder: index + 1,
+        })));
+        setDomains(mappedDomains);
+        setRecords(mappedRecords);
+        setRegistrars((registrarPayload.registrars || []).map((r: any) => ({
+          id: r.id, provider: r.provider, name: r.displayName, apiKey: '', accountEmail: r.accountEmail || '',
+          status: r.status === 'connected' ? 'connected' : 'disconnected', lastSynced: r.lastSyncedAt || '', domainsCount: 0, autoSyncIntervalMinutes: 15,
+        })));
+        if (auditPayload.logs) setAuditLogs(auditPayload.logs);
+        if (mappedDomains.length) setSelectedDomainId(current => mappedDomains.some(d => d.id === current) ? current : mappedDomains[0].id);
+        setSyncStatus('synced');
+      } catch {
+        if (active) setSyncStatus('offline');
+      }
+    };
+    void hydrate();
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(`${STORAGE_KEY_PREFIX}notifications`, JSON.stringify(notificationSettings));
   }, [notificationSettings]);
-
-  useEffect(() => {
-    localStorage.setItem(`${STORAGE_KEY_PREFIX}audit`, JSON.stringify(auditLogs));
-  }, [auditLogs]);
 
   useEffect(() => {
     localStorage.setItem(`${STORAGE_KEY_PREFIX}team`, JSON.stringify(teamMembers));
@@ -292,25 +309,27 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     diff?: AuditLogEntry['diff'],
     rollbackable: boolean = true
   ) => {
-    const entry: AuditLogEntry = {
-      id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 4)}`,
-      timestamp: new Date().toISOString(),
-      actor: {
-        name: currentUser.name,
-        email: currentUser.email,
-        role: currentUser.role,
-        avatar: currentUser.avatar
-      },
-      ipAddress: '113.161.44.18 (Viettel HCM)',
-      action,
-      domainName,
-      recordName,
-      recordType,
-      details,
-      diff,
-      rollbackable
+    const allowedActions = ['ROLLBACK', 'REGISTRAR_SYNC', 'SSL_RENEWED', '2FA_ENABLED', 'ROLE_CHANGED', 'DDNS_AUTO_UPDATE'];
+    if (!allowedActions.includes(action)) return;
+    const payload = {
+      action, domainName, details, recordName,
+      recordType: typeof recordType === 'string' ? recordType : undefined,
+      before: diff?.before, after: diff?.after, rollbackable,
     };
-    setAuditLogs(prev => [entry, ...prev]);
+    void fetch('/api/audit-logs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }).then(async response => {
+      if (!response.ok) throw new Error('Audit log persistence failed');
+      const result = await fetch('/api/audit-logs?limit=100', { cache: 'no-store' });
+      if (!result.ok) throw new Error('Audit log refresh failed');
+      const data = await result.json();
+      setAuditLogs(Array.isArray(data.logs) ? data.logs : []);
+    }).catch(() => {
+      setSyncStatus('offline');
+      dispatchAlert('Không thể lưu Audit Log', 'Máy chủ chưa xác nhận bản ghi kiểm toán; vui lòng thử lại.', 'error');
+    });
   };
 
   // Helper to dispatch alert notification
@@ -347,26 +366,28 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setRecords(prev => [...prev, newRecord]);
-
-    // Update domain record count
     setDomains(prev => prev.map(d => d.id === recordData.domainId ? { ...d, recordCount: d.recordCount + 1 } : d));
 
-    logAudit(
-      'CREATE_RECORD',
-      recordData.domainName,
-      `Tạo mới bản ghi ${recordData.name} (${recordData.type}) trỏ tới ${recordData.content}`,
-      recordData.name,
-      recordData.type,
-      { after: newRecord },
-      true
-    );
-
-    dispatchAlert(
-      `Bản ghi ${recordData.type} mới đã tạo`,
-      `${recordData.name}.${recordData.domainName} -> ${recordData.content}`,
-      'success',
-      recordData.domainName
-    );
+    void fetch(`/api/domains/${encodeURIComponent(recordData.domainId)}/records`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: recordData.type, name: recordData.name, content: recordData.content, ttl: recordData.ttl, priority: recordData.priority, port: recordData.port, weight: recordData.weight, proxied: recordData.proxied, comment: recordData.comment }),
+    }).then(async response => {
+      if (!response.ok) throw new Error('DNS record save failed');
+      const payload = await response.json();
+      if (!payload.record?.id) throw new Error('Missing persisted DNS record id');
+      setRecords(prev => prev.map(item => item.id === newRecord.id ? { ...item, id: payload.record.id, lastUpdated: payload.record.updatedAt || item.lastUpdated } : item));
+      dispatchAlert(
+        `Bản ghi ${recordData.type} mới đã tạo`,
+        `${recordData.name}.${recordData.domainName} đã được PostgreSQL xác nhận`,
+        'success',
+        recordData.domainName
+      );
+    }).catch(() => {
+      setRecords(prev => prev.filter(item => item.id !== newRecord.id));
+      setDomains(prev => prev.map(d => d.id === recordData.domainId ? { ...d, recordCount: Math.max(0, d.recordCount - 1) } : d));
+      setSyncStatus('offline');
+      dispatchAlert('Không thể lưu DNS record', 'PostgreSQL chưa xác nhận thao tác; thay đổi tạm đã được hoàn tác.', 'error', recordData.domainName);
+    });
 
     return newRecord;
   };
@@ -383,23 +404,22 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     };
 
     setRecords(prev => prev.map(r => r.id === id ? updatedRecord : r));
-
-    logAudit(
-      'UPDATE_RECORD',
-      existing.domainName,
-      `Cập nhật bản ghi ${existing.name} (${existing.type}): ${updates.content ? `Giá trị mới: ${updates.content}` : 'Thay đổi cấu hình'}`,
-      existing.name,
-      existing.type,
-      { before: existing, after: updatedRecord },
-      true
-    );
-
-    dispatchAlert(
-      `Bản ghi DNS được cập nhật`,
-      `${existing.name}.${existing.domainName} (${existing.type}) đã được điều chỉnh`,
-      'info',
-      existing.domainName
-    );
+    void fetch(`/api/domains/${encodeURIComponent(existing.domainId)}/records/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ type: updates.type, name: updates.name, content: updates.content, ttl: updates.ttl, proxied: updates.proxied, comment: updates.comment }),
+    }).then(response => {
+      if (!response.ok) throw new Error('DNS record update failed');
+      dispatchAlert(
+        'Bản ghi DNS được cập nhật',
+        `${existing.name}.${existing.domainName} (${existing.type}) đã được PostgreSQL xác nhận cập nhật`,
+        'success',
+        existing.domainName
+      );
+    }).catch(() => {
+      setRecords(prev => prev.map(r => r.id === id ? existing : r));
+      setSyncStatus('offline');
+      dispatchAlert('Không thể cập nhật DNS record', 'PostgreSQL chưa xác nhận thao tác; bản ghi cũ đã được khôi phục.', 'error', existing.domainName);
+    });
   };
 
   const deleteRecord = (id: string) => {
@@ -409,22 +429,22 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRecords(prev => prev.filter(r => r.id !== id));
     setDomains(prev => prev.map(d => d.id === existing.domainId ? { ...d, recordCount: Math.max(0, d.recordCount - 1) } : d));
 
-    logAudit(
-      'DELETE_RECORD',
-      existing.domainName,
-      `Xóa bản ghi ${existing.name} (${existing.type}) từng trỏ tới ${existing.content}`,
-      existing.name,
-      existing.type,
-      { before: existing },
-      true
-    );
-
-    dispatchAlert(
-      `Bản ghi DNS đã bị xóa`,
-      `${existing.name}.${existing.domainName} (${existing.type}) đã bị loại khỏi Zone`,
-      'warning',
-      existing.domainName
-    );
+    void fetch(`/api/domains/${encodeURIComponent(existing.domainId)}/records/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      .then(response => {
+        if (!response.ok) throw new Error('DNS record delete failed');
+        dispatchAlert(
+          'Bản ghi DNS đã bị xóa',
+          `${existing.name}.${existing.domainName} (${existing.type}) đã được PostgreSQL xác nhận xóa`,
+          'success',
+          existing.domainName
+        );
+      })
+      .catch(() => {
+        setRecords(prev => prev.some(r => r.id === id) ? prev : [...prev, existing]);
+        setDomains(prev => prev.map(d => d.id === existing.domainId ? { ...d, recordCount: d.recordCount + 1 } : d));
+        setSyncStatus('offline');
+        dispatchAlert('Không thể xóa DNS record', 'PostgreSQL chưa xác nhận thao tác; bản ghi đã được khôi phục.', 'error', existing.domainName);
+      });
   };
 
   const rollbackRecord = (logId: string): boolean => {
@@ -514,6 +534,41 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       delegationSynced: true
     };
 
+    // Persist the domain first; replace the temporary UI id with the database id.
+    let persistedDomainId: string | undefined;
+    void fetch('/api/domains', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: newDomain.name, registrar: newDomain.registrar, autoRenew: newDomain.autoRenew, nameservers: newDomain.nameservers, dnssec: newDomain.dnssec, environment: newDomain.environment }),
+    }).then(async response => {
+      if (!response.ok) throw new Error('Domain create failed');
+      const payload = await response.json();
+      const persisted = payload.domain;
+      if (!persisted?.id) throw new Error('Missing persisted domain id');
+      persistedDomainId = persisted.id;
+      const seeded = [defaultApexA, defaultCname];
+      const savedRecords = await Promise.all(seeded.map(async record => {
+        const recordResponse = await fetch(`/api/domains/${encodeURIComponent(persisted.id)}/records`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ type: record.type, name: record.name, content: record.content, ttl: record.ttl, proxied: record.proxied, comment: record.comment }),
+        });
+        if (!recordResponse.ok) throw new Error('Initial DNS record create failed');
+        const recordPayload = await recordResponse.json();
+        return { ...record, id: recordPayload.record.id, domainId: persisted.id, lastUpdated: recordPayload.record.updatedAt };
+      }));
+      setDomains(prev => prev.map(item => item.id === newDomain.id ? { ...item, id: persisted.id, createdAt: persisted.createdAt, recordCount: savedRecords.length } : item));
+      setRecords(prev => [...prev.filter(item => item.domainId !== newDomain.id), ...savedRecords]);
+      setSelectedDomainId(current => current === newDomain.id ? persisted.id : current);
+      dispatchAlert('Tên miền mới đã thêm', `${newDomain.name} đã được PostgreSQL xác nhận cùng ${savedRecords.length} bản ghi DNS khởi tạo`, 'success', newDomain.name);
+    }).catch(async () => {
+      if (persistedDomainId) {
+        // Compensate a partially completed seed operation to avoid orphaned domains.
+        await fetch(`/api/domains/${encodeURIComponent(persistedDomainId)}`, { method: 'DELETE' }).catch(() => undefined);
+      }
+      setDomains(prev => prev.filter(item => item.id !== newDomain.id));
+      setRecords(prev => prev.filter(item => item.domainId !== newDomain.id));
+      setSyncStatus('offline');
+      dispatchAlert('Không thể tạo domain', 'PostgreSQL chưa xác nhận thao tác; dữ liệu tạm đã được hoàn tác.', 'error', newDomain.name);
+    });
     setDomains(prev => [...prev, newDomain]);
 
     // Seed default NS records and apex A record
@@ -556,9 +611,6 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setRecords(prev => [...prev, defaultApexA, defaultCname]);
     setSelectedDomainId(newDomain.id);
 
-    logAudit('DOMAIN_ADDED', newDomain.name, `Đăng ký & ủy quyền quản lý tên miền mới qua ${newDomain.registrar}`, undefined, undefined, undefined, false);
-    dispatchAlert('Tên miền mới đã thêm', `${newDomain.name} đã được thiết lập vùng DNS`, 'success', newDomain.name);
-
     return newDomain;
   };
 
@@ -588,18 +640,22 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     const domain = domains.find(d => d.id === id);
     if (!domain) return;
 
-    setDomains(prev => prev.filter(d => d.id !== id));
-    setRecords(prev => prev.filter(r => r.domainId !== id));
-
-    if (selectedDomainId === id) {
-      const remaining = domains.filter(d => d.id !== id);
-      if (remaining.length > 0) {
-        setSelectedDomainId(remaining[0].id);
-      }
-    }
-
-    logAudit('DELETE_RECORD', domain.name, `Xóa toàn bộ vùng tên miền ${domain.name} và tất cả bản ghi liên quan`, undefined, undefined, undefined, false);
-    dispatchAlert('Vùng tên miền đã bị gỡ bỏ', `${domain.name} đã ngừng quản lý DNS`, 'warning', domain.name);
+    // Confirm deletion in PostgreSQL before removing the domain from the UI.
+    void fetch(`/api/domains/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      .then(response => {
+        if (!response.ok) throw new Error('Domain delete failed');
+        setDomains(prev => prev.filter(d => d.id !== id));
+        setRecords(prev => prev.filter(r => r.domainId !== id));
+        if (selectedDomainId === id) {
+          const remaining = domains.filter(d => d.id !== id);
+          setSelectedDomainId(remaining[0]?.id || '');
+        }
+        dispatchAlert('Vùng tên miền đã bị gỡ bỏ', `${domain.name} đã được PostgreSQL xác nhận xóa`, 'success', domain.name);
+      })
+      .catch(() => {
+        setSyncStatus('offline');
+        dispatchAlert('Không thể xóa domain', 'PostgreSQL chưa xác nhận thao tác; domain vẫn được giữ lại.', 'error', domain.name);
+      });
   };
 
   // Registrars
@@ -622,14 +678,18 @@ export const DnsProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const updateRegistrarApiKey = (id: string, apiKey: string, apiSecret?: string) => {
-    setRegistrars(prev => prev.map(r => r.id === id ? {
-      ...r,
-      apiKey,
-      apiSecret: apiSecret ?? r.apiSecret,
-      status: 'connected',
-      lastSynced: new Date().toISOString()
-    } : r));
-    dispatchAlert('Cập nhật API Registrar', 'Khóa API đã được lưu an toàn', 'info');
+    const registrar = registrars.find(item => item.id === id);
+    if (!registrar) return;
+    const credentials = registrar.provider === 'Cloudflare'
+      ? { apiToken: apiKey }
+      : { apiKey, ...(apiSecret ? { apiSecret } : {}) };
+    void fetch(`/api/registrars/${encodeURIComponent(id)}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ credentials }),
+    }).then(response => {
+      if (!response.ok) throw new Error('Credential save failed');
+      setRegistrars(prev => prev.map(r => r.id === id ? { ...r, apiKey: '', apiSecret: undefined, status: 'connected', lastSynced: new Date().toISOString() } : r));
+      dispatchAlert('Cập nhật API Registrar', 'Credential đã được mã hóa và lưu phía máy chủ.', 'success');
+    }).catch(() => dispatchAlert('Không thể lưu API Registrar', 'Kiểm tra cấu hình mã hóa credential trên Vercel Preview.', 'error'));
   };
 
   // Notifications
